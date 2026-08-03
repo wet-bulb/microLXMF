@@ -5,6 +5,15 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# THICKET TEST BRANCH ONLY. Not for upstream.
+# Runs the whole conformance suite at the pool dimensions we actually ship on
+# an nRF52840, rather than the defaults, where the override patch is inert.
+# Applied globally so every translation unit agrees on the struct layout.
+add_compile_definitions(
+    LXMF_MAX_CONVERSATIONS=8
+    LXMF_MAX_MESSAGES_PER_CONVERSATION=32
+)
+
 include(FetchContent)
 
 # ============================================================================
