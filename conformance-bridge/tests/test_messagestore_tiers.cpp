@@ -41,6 +41,7 @@
 using LXMF::MessageStore;
 using LXMF::LXMessage;
 using LXMF::HOT_MESSAGES_PER_CONVERSATION;
+using LXMF::MAX_CONVERSATIONS;
 using LXMF::MAX_MESSAGES_PER_CONVERSATION;
 using RNS::Bytes;
 
@@ -822,6 +823,152 @@ static void test_hard_cap_eviction() {
     rmrf(hot_root); rmrf(archive_root);
 }
 
+
+// A store written by a build with LARGER pool limits, reopened by this one.
+//
+// This is not a corrupt index, it is a bigger one, and the two need different
+// answers. Rejecting clears every conversation and then fails the same way on
+// the backup generation, because the cause is the build configuration rather
+// than damage: the user loses everything on a rebuild. The policy is to
+// truncate and carry on, dropping the least recently active conversations and
+// the oldest messages within a conversation.
+//
+// The limits are compile-time, so a single binary cannot write at one size and
+// read at another. The oversized index is written by hand instead.
+static void test_index_downgrade_truncates() {
+    std::cout << "\n=== test_index_downgrade_truncates ===\n";
+
+    std::string hot_root = "/tmp/mstore_downgrade_test";
+    rmrf(hot_root);
+    mkdir(hot_root.c_str(), 0755);
+
+    const size_t extra_convs = 3;
+    const size_t total_convs = MAX_CONVERSATIONS + extra_convs;
+    const size_t extra_msgs  = 5;
+    const size_t total_msgs  = MAX_MESSAGES_PER_CONVERSATION + extra_msgs;
+
+    // Conversation i gets last_activity = i, so the LOWEST-numbered peers are
+    // the least recently active and are the ones that should be dropped.
+    // Conversation 0 also carries the oversized message list.
+    std::string json = "{\"conversations\":[";
+    for (size_t c = 0; c < total_convs; ++c) {
+        char peer[33];
+        snprintf(peer, sizeof(peer), "%032zx", c + 1);
+        if (c) json += ",";
+        json += "{\"peer_hash\":\"" + std::string(peer) + "\",\"messages\":[";
+        size_t n = (c == 0) ? total_msgs : 1;
+        std::string last_hash;
+        for (size_t m = 0; m < n; ++m) {
+            char mh[65];
+            snprintf(mh, sizeof(mh), "%064zx", (c + 1) * 100000 + m);
+            if (m) json += ",";
+            json += "\"" + std::string(mh) + "\"";
+            last_hash = mh;
+        }
+        json += "],\"last_activity\":" + std::to_string((double)c) +
+                ",\"unread_count\":0,\"last_message_hash\":\"" + last_hash + "\"}";
+    }
+    json += "]}";
+
+    std::string index_file = hot_root + "/conv.json";
+    FILE* f = fopen(index_file.c_str(), "wb");
+    EXPECT_TRUE(f != nullptr, "write oversized index");
+    fwrite(json.data(), 1, json.size(), f);
+    fclose(f);
+
+    test_fs::PrefixedFS hot_fs(hot_root);
+    RNS::Utilities::OS::register_filesystem(hot_fs);
+
+    MessageStore store("/lxmf");
+
+    // The store must come up. Before truncation this wiped every slot.
+    EXPECT_EQ((int)store.get_conversations().size(), (int)MAX_CONVERSATIONS,
+              "index truncated to the pool size rather than wiped");
+
+    // The dropped ones must be the least recently active, i.e. the lowest
+    // peer numbers, since last_activity was assigned in the same order.
+    auto peers = store.get_conversations();
+    EXPECT_EQ((int)peers.size(), (int)MAX_CONVERSATIONS, "conversation list size");
+    bool dropped_oldest = true;
+    for (const auto& ph : peers) {
+        unsigned long n = strtoul(ph.toHex().c_str(), nullptr, 16);
+        if (n <= extra_convs) dropped_oldest = false;
+    }
+    EXPECT_TRUE(dropped_oldest,
+                "least recently active conversations were the ones dropped");
+
+    // Conversation 0 carried the oversized message list, and it is one of the
+    // dropped ones, so build the check on whichever kept conversation had the
+    // long list. With extra_convs=3 and last_activity ascending, conversation
+    // 0 is dropped; assert instead that no kept conversation exceeds the cap.
+    for (const auto& ph : peers) {
+        auto msgs = store.get_messages_for_conversation(ph);
+        EXPECT_TRUE(msgs.size() <= MAX_MESSAGES_PER_CONVERSATION,
+                    "conversation ..." + ph.toHex().substr(ph.toHex().size() - 8) +
+                    " within the message cap after load");
+    }
+
+    RNS::Utilities::OS::deregister_filesystem();
+    rmrf(hot_root);
+}
+
+// The message-level truncation on its own: one conversation, more messages
+// than this build can hold, and the NEWEST must be the ones kept.
+static void test_index_downgrade_keeps_newest_messages() {
+    std::cout << "\n=== test_index_downgrade_keeps_newest_messages ===\n";
+
+    std::string hot_root = "/tmp/mstore_downgrade_msgs_test";
+    rmrf(hot_root);
+    mkdir(hot_root.c_str(), 0755);
+
+    const size_t extra = 5;
+    const size_t total = MAX_MESSAGES_PER_CONVERSATION + extra;
+
+    std::string json = "{\"conversations\":[{\"peer_hash\":\"";
+    json += std::string(32, 'a');
+    json += "\",\"messages\":[";
+    std::string last_hash;
+    for (size_t m = 0; m < total; ++m) {
+        char mh[65];
+        snprintf(mh, sizeof(mh), "%064zx", m);
+        if (m) json += ",";
+        json += "\"" + std::string(mh) + "\"";
+        last_hash = mh;
+    }
+    json += "],\"last_activity\":1.0,\"unread_count\":0,\"last_message_hash\":\"" +
+            last_hash + "\"}]}";
+
+    std::string index_file = hot_root + "/conv.json";
+    FILE* f = fopen(index_file.c_str(), "wb");
+    EXPECT_TRUE(f != nullptr, "write oversized single-conversation index");
+    fwrite(json.data(), 1, json.size(), f);
+    fclose(f);
+
+    test_fs::PrefixedFS hot_fs(hot_root);
+    RNS::Utilities::OS::register_filesystem(hot_fs);
+
+    MessageStore store("/lxmf");
+    EXPECT_EQ((int)store.get_conversations().size(), 1, "conversation survived downgrade");
+
+    Bytes peer; peer.assignHex(std::string(32, 'a').c_str());
+    auto msgs = store.get_messages_for_conversation(peer);
+    EXPECT_EQ((int)msgs.size(), (int)MAX_MESSAGES_PER_CONVERSATION,
+              "message list truncated to the cap");
+
+    // Oldest dropped, newest kept: the first retained hash is index `extra`,
+    // and the final one is the last message written.
+    char expect_first[65], expect_last[65];
+    snprintf(expect_first, sizeof(expect_first), "%064zx", extra);
+    snprintf(expect_last, sizeof(expect_last), "%064zx", total - 1);
+    EXPECT_EQ(msgs.front().toHex(), std::string(expect_first),
+              "oldest messages were the ones dropped");
+    EXPECT_EQ(msgs.back().toHex(), std::string(expect_last),
+              "newest message retained");
+
+    RNS::Utilities::OS::deregister_filesystem();
+    rmrf(hot_root);
+}
+
 int main() {
     std::cout << "MessageStore tier tests\n";
     std::cout << "HOT_MESSAGES_PER_CONVERSATION = "
@@ -842,6 +989,8 @@ int main() {
         test_cull_without_archive_deletes();
         test_cull_to_hot_with_archive();
         test_hard_cap_eviction();
+        test_index_downgrade_truncates();
+        test_index_downgrade_keeps_newest_messages();
     } catch (const std::exception& e) {
         std::cerr << "FATAL: uncaught exception: " << e.what() << "\n";
         return 2;

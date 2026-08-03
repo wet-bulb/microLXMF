@@ -4,6 +4,7 @@
 
 #include <ArduinoJson.h>
 #include <algorithm>
+#include <vector>
 #include <set>
 #include <sstream>
 
@@ -180,13 +181,37 @@ bool MessageStore::load_index_file(const std::string& index_path) {
 			return reject_index("Conversation index has no conversations array");
 		}
 		JsonArray conversations = _json_doc["conversations"].as<JsonArray>();
-		if (conversations.size() > MAX_CONVERSATIONS) {
-			return reject_index("Conversation index exceeds fixed pool capacity");
+
+		// An index written by a build with larger limits is not corrupt, it is
+		// just bigger than this build can hold. Rejecting it clears every
+		// conversation and then fails identically on the backup generation,
+		// because the cause is the build configuration rather than damage. So
+		// truncate instead, dropping the least recently active conversations
+		// and keeping the store usable.
+		std::vector<size_t> load_order;
+		load_order.reserve(conversations.size());
+		for (size_t i = 0; i < conversations.size(); ++i) {
+			load_order.push_back(i);
 		}
+		if (conversations.size() > MAX_CONVERSATIONS) {
+			std::stable_sort(load_order.begin(), load_order.end(),
+				[&conversations](size_t a, size_t b) {
+					double aa = conversations[a]["last_activity"] | 0.0;
+					double bb = conversations[b]["last_activity"] | 0.0;
+					return aa > bb;
+				});
+			WARNING("Conversation index holds " + std::to_string(conversations.size()) +
+			        " conversations but this build fits " + std::to_string(MAX_CONVERSATIONS) +
+			        "; dropping the " + std::to_string(conversations.size() - MAX_CONVERSATIONS) +
+			        " least recently active");
+			load_order.resize(MAX_CONVERSATIONS);
+		}
+
 		std::set<std::string> peer_hashes;
 		std::set<std::string> message_hashes;
 		size_t slot_index = 0;
-		for (JsonObject conv : conversations) {
+		for (size_t conv_index : load_order) {
+			JsonObject conv = conversations[conv_index];
 			ConversationSlot& slot = _conversations_pool[slot_index];
 
 			// Parse peer hash
@@ -211,10 +236,23 @@ bool MessageStore::load_index_file(const std::string& index_path) {
 				return reject_index("Conversation index entry has no messages array");
 			}
 			JsonArray messages = conv["messages"].as<JsonArray>();
+
+			// Same policy as above, one level down. Messages are appended in
+			// chronological order, so the oldest live at the lowest indices and
+			// truncation drops from the front. Their payload files are left in
+			// place: unreferenced, but recoverable, and the next save_message
+			// cull reclaims space through the normal path.
+			size_t drop_oldest = 0;
 			if (messages.size() > MAX_MESSAGES_PER_CONVERSATION) {
-				return reject_index("Conversation index entry exceeds message capacity");
+				drop_oldest = messages.size() - MAX_MESSAGES_PER_CONVERSATION;
+				WARNING("Conversation " + peer_bytes.toHex().substr(0, 16) +
+				        "... holds " + std::to_string(messages.size()) +
+				        " messages but this build fits " +
+				        std::to_string(MAX_MESSAGES_PER_CONVERSATION) +
+				        "; dropping the " + std::to_string(drop_oldest) + " oldest");
 			}
 			std::set<std::string> conversation_messages;
+			size_t msg_index = 0;
 			for (const char* msg_hex : messages) {
 				if (!msg_hex) return reject_index("Conversation index has a null message hash");
 				Bytes msg_hash;
@@ -223,10 +261,17 @@ bool MessageStore::load_index_file(const std::string& index_path) {
 					return reject_index("Conversation index has an invalid message hash");
 				}
 				std::string canonical_hash = msg_hash.toHex();
+				// A duplicate is still a corruption signal and is still fatal,
+				// whether or not this particular hash is about to be dropped.
 				if (!conversation_messages.insert(canonical_hash).second ||
-				    !message_hashes.insert(canonical_hash).second ||
-				    !slot.info.add_message_hash(msg_hash)) {
+				    !message_hashes.insert(canonical_hash).second) {
 					return reject_index("Conversation index contains a duplicate message hash");
+				}
+				if (msg_index++ < drop_oldest) {
+					continue;
+				}
+				if (!slot.info.add_message_hash(msg_hash)) {
+					return reject_index("Conversation index entry exceeds message capacity");
 				}
 			}
 
