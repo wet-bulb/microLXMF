@@ -162,7 +162,7 @@ bool MessageStore::load_index_file(const std::string& index_path) {
 	try {
 		// Read JSON file via OS abstraction (SPIFFS compatible)
 		Bytes data;
-		if (Utilities::OS::read_file(index_path.c_str(), data) == 0) {
+		if (read_through(index_path.c_str(), data) == 0) {
 			ERROR("Failed to read index file or index is empty: " + index_path);
 			return false;
 		}
@@ -370,14 +370,14 @@ bool MessageStore::save_index(bool empty) {
 		// Never truncate the only committed index in place. Write and verify a
 		// temporary file, then replace the index with a recoverable two-rename
 		// transaction. load_index() restores /conv.bak after an interrupted boot.
-		if (Utilities::OS::write_file(temp_path.c_str(), data) != data.size()) {
+		if (write_through(temp_path.c_str(), data) != data.size()) {
 			ERROR("Failed to write temporary index file: " + temp_path);
 			Utilities::OS::remove_file(temp_path.c_str());
 			return false;
 		}
 
 		Bytes verify;
-		if (Utilities::OS::read_file(temp_path.c_str(), verify) != data.size() ||
+		if (read_through(temp_path.c_str(), verify) != data.size() ||
 		    verify.size() != data.size() ||
 		    memcmp(verify.data(), data.data(), data.size()) != 0) {
 			ERROR("Failed to verify temporary conversation index");
@@ -515,13 +515,13 @@ bool MessageStore::save_message(const LXMessage& message) {
 			}
 		}
 
-		if (Utilities::OS::write_file(temp_message_path.c_str(), data) != data.size()) {
+		if (write_through(temp_message_path.c_str(), data) != data.size()) {
 			ERROR("Failed to write temporary message file: " + temp_message_path);
 			Utilities::OS::remove_file(temp_message_path.c_str());
 			return false;
 		}
 		Bytes verify_payload;
-		if (Utilities::OS::read_file(temp_message_path.c_str(), verify_payload) != data.size() ||
+		if (read_through(temp_message_path.c_str(), verify_payload) != data.size() ||
 		    verify_payload.size() != data.size() ||
 		    memcmp(verify_payload.data(), data.data(), data.size()) != 0) {
 			ERROR("Failed to verify temporary message payload");
@@ -714,6 +714,55 @@ bool MessageStore::has_archive() const {
 	return (bool)_archive_fs;
 }
 
+void MessageStore::set_codec(Codec encode, Codec decode) {
+	// Both or neither. A store that encodes but cannot decode writes files it
+	// can never read again, and the failure would not surface until a reboot.
+	if ((bool)encode != (bool)decode) {
+		ERROR("MessageStore::set_codec requires both halves or neither; ignoring");
+		return;
+	}
+	_encode = encode;
+	_decode = decode;
+}
+
+bool MessageStore::has_codec() const {
+	return (bool)_encode && (bool)_decode;
+}
+
+size_t MessageStore::write_through(const char* path, const Bytes& data) {
+	if (!_encode) {
+		return Utilities::OS::write_file(path, data);
+	}
+	Bytes encoded;
+	if (!_encode(data, encoded)) {
+		ERROR(std::string("Codec failed to encode ") + path);
+		return 0;
+	}
+	size_t wrote = Utilities::OS::write_file(path, encoded);
+	if (wrote != encoded.size()) return 0;
+	// Report what the caller gave us, not what landed on disk. Callers compare
+	// this against data.size(); an encoder that adds a MAC would otherwise
+	// look like a short write on every single save.
+	return data.size();
+}
+
+size_t MessageStore::read_through(const char* path, Bytes& data) {
+	if (!_decode) {
+		return Utilities::OS::read_file(path, data);
+	}
+	Bytes raw;
+	if (Utilities::OS::read_file(path, raw) == 0) return 0;
+	Bytes decoded;
+	if (!_decode(raw, decoded)) {
+		// Indistinguishable from a corrupt file, and that is right: a failed
+		// authentication IS a corrupt file as far as this store is concerned.
+		WARNING(std::string("Codec failed to decode ") + path);
+		return 0;
+	}
+	data = decoded;
+	return data.size();
+}
+
 bool MessageStore::set_display_name(const Bytes& peer_hash,
                                     const std::string& display_name) {
 	ConversationSlot* slot = find_conversation(peer_hash);
@@ -772,7 +821,7 @@ bool MessageStore::archive_one_message(const Bytes& message_hash) {
 
 	if (_archive_fs) {
 		Bytes data;
-		if (Utilities::OS::read_file(hot_path.c_str(), data) == 0) {
+		if (read_through(hot_path.c_str(), data) == 0) {
 			WARNING("archive_one_message: unable to read hot payload " + hot_path);
 			return false;
 		}
@@ -882,7 +931,7 @@ bool MessageStore::recover_message_payload(const std::string& message_path,
 	bool has_backup = Utilities::OS::file_exists(backup_path.c_str());
 	auto valid_payload = [&](const std::string& path) {
 		Bytes data;
-		if (Utilities::OS::read_file(path.c_str(), data) == 0) return false;
+		if (read_through(path.c_str(), data) == 0) return false;
 		_json_doc.clear();
 		if (deserializeJson(_json_doc, data.data(), data.size())) return false;
 		const char* stored_hash = _json_doc["hash"];
@@ -967,7 +1016,7 @@ LXMessage MessageStore::load_message(const Bytes& message_hash) {
 		Bytes data;
 		size_t n_read = 0;
 		if (in_hot) {
-			n_read = Utilities::OS::read_file(message_path.c_str(), data);
+			n_read = read_through(message_path.c_str(), data);
 		} else {
 			std::string arch_path = get_archive_message_path(message_hash);
 			n_read = read_archive_file(arch_path.c_str(), data);
@@ -1040,9 +1089,9 @@ MessageStore::MessageMetadata MessageStore::load_message_metadata(const Bytes& m
 		if (Utilities::OS::file_exists(backup_path.c_str())) {
 			recover_message_payload(message_path, message_hash);
 		}
-		size_t n_read = Utilities::OS::read_file(message_path.c_str(), data);
+		size_t n_read = read_through(message_path.c_str(), data);
 		if (n_read == 0 && recover_message_payload(message_path, message_hash)) {
-			n_read = Utilities::OS::read_file(message_path.c_str(), data);
+			n_read = read_through(message_path.c_str(), data);
 		}
 		if (n_read == 0 && recover_archived_message_payload(message_hash)) {
 			std::string arch_path = get_archive_message_path(message_hash);
@@ -1158,7 +1207,7 @@ bool MessageStore::update_message_state(const Bytes& message_hash, Type::Message
 
 	try {
 		Bytes data;
-		if (Utilities::OS::read_file(message_path.c_str(), data) == 0) {
+		if (read_through(message_path.c_str(), data) == 0) {
 			ERROR("Failed to read message file: " + message_path);
 			return false;
 		}
@@ -1185,13 +1234,13 @@ bool MessageStore::update_message_state(const Bytes& message_hash, Type::Message
 		std::string backup_path = stem + ".bak";
 		Utilities::OS::remove_file(temp_path.c_str());
 		Utilities::OS::remove_file(backup_path.c_str());
-		if (Utilities::OS::write_file(temp_path.c_str(), replacement) != replacement.size()) {
+		if (write_through(temp_path.c_str(), replacement) != replacement.size()) {
 			ERROR("Failed to write temporary message-state payload");
 			Utilities::OS::remove_file(temp_path.c_str());
 			return false;
 		}
 		Bytes verify;
-		if (Utilities::OS::read_file(temp_path.c_str(), verify) != replacement.size() ||
+		if (read_through(temp_path.c_str(), verify) != replacement.size() ||
 		    verify.size() != replacement.size()) {
 			ERROR("Failed to verify temporary message-state payload");
 			Utilities::OS::remove_file(temp_path.c_str());

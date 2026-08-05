@@ -5,6 +5,7 @@
 
 #include <ArduinoJson.h>
 #include <microStore/FileSystem.h>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -247,6 +248,46 @@ namespace LXMF {
 		 * @brief Whether an archive filesystem is configured
 		 */
 		bool has_archive() const;
+
+		/**
+		 * @brief Transform applied to a file's contents on the way to and
+		 *        from storage.
+		 *
+		 * Returns true on success. On false the operation is treated as a
+		 * failed write or a failed read, which the caller already handles:
+		 * a decode that fails is indistinguishable from a corrupt file, and
+		 * that is the correct reading of an authentication failure.
+		 */
+		using Codec = std::function<bool(const RNS::Bytes& in, RNS::Bytes& out)>;
+
+		/**
+		 * @brief Install a codec over everything this store persists.
+		 *
+		 * Both halves must be set together, and each must invert the other.
+		 * When unset -- the default -- every file is written and read exactly
+		 * as before; the store has no opinion about what a codec does.
+		 *
+		 * The intended use is encryption at rest. It is expressed as a codec
+		 * rather than as encryption so that this class carries no crypto, no
+		 * key material and no dependency on a cipher: the caller owns all
+		 * three, and a caller that wants compression or a checksum instead
+		 * gets the same seam.
+		 *
+		 * Sizes reported to callers stay in DECODED bytes. A codec that
+		 * changes length -- any authenticated cipher does -- would otherwise
+		 * break the store's own write-then-verify-readback checks, which
+		 * compare against the length of what they handed in.
+		 *
+		 * @param encode Applied before writing. Pass {} with `decode` to
+		 *               restore plain behaviour.
+		 * @param decode Applied after reading.
+		 */
+		void set_codec(Codec encode, Codec decode);
+
+		/**
+		 * @brief Whether a codec is installed
+		 */
+		bool has_codec() const;
 
 		/**
 		 * @brief Cache a peer's LXMF display name in the conversation
@@ -521,9 +562,21 @@ namespace LXMF {
 		size_t write_archive_file(const char* path, const RNS::Bytes& data);
 
 	private:
+		/**
+		 * @brief write_file / read_file, with the codec applied if one is set.
+		 *
+		 * Every persisting call in this class goes through these two rather
+		 * than through Utilities::OS directly, so that installing a codec
+		 * cannot miss a path. Both report DECODED sizes -- see set_codec().
+		 */
+		size_t write_through(const char* path, const RNS::Bytes& data);
+		size_t read_through(const char* path, RNS::Bytes& data);
+
 		std::string _base_path;
 		ConversationSlot _conversations_pool[MAX_CONVERSATIONS];
 		bool _initialized;
+		Codec _encode;
+		Codec _decode;
 
 		// Optional archive filesystem (eg microSD). When `_archive_fs`
 		// is truthy, save_message cull-walks each conversation and
