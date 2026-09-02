@@ -335,6 +335,16 @@ LXMRouter::PendingProofSlot* LXMRouter::find_pending_proof_slot(const Bytes& has
 	return nullptr;
 }
 
+void LXMRouter::release_pending_proofs_for_message(const Bytes& message_hash) {
+	if (message_hash.size() != HASH_SIZE) return;
+	for (size_t i = 0; i < PENDING_PROOFS_SIZE; i++) {
+		if (_pending_proofs_pool[i].in_use &&
+		    memcmp(_pending_proofs_pool[i].message_hash, message_hash.data(), HASH_SIZE) == 0) {
+			_pending_proofs_pool[i].clear();
+		}
+	}
+}
+
 LXMRouter::PendingProofSlot* LXMRouter::find_empty_pending_proof_slot() {
 	for (size_t i = 0; i < PENDING_PROOFS_SIZE; i++) {
 		if (!_pending_proofs_pool[i].in_use) {
@@ -880,6 +890,7 @@ void LXMRouter::process_outbound() {
 		if (message.delivery_attempts() >= MAX_DELIVERY_ATTEMPTS) {
 			WARNING("Max delivery attempts reached for message to " + message.destination_hash().toHex());
 			message.state(Type::Message::FAILED);
+			release_pending_proofs_for_message(message.hash());
 			if (_failed_callback) {
 				_failed_callback(message);
 			}
@@ -960,6 +971,7 @@ void LXMRouter::process_outbound() {
 			} else {
 				ERROR("Failed to send OPPORTUNISTIC message");
 				message.state(Type::Message::FAILED);
+				release_pending_proofs_for_message(message.hash());
 
 				if (_failed_callback) {
 					_failed_callback(message);
@@ -1017,6 +1029,7 @@ void LXMRouter::process_outbound() {
 			} else {
 				ERROR("Failed to send message via link");
 				message.state(Type::Message::FAILED);
+				release_pending_proofs_for_message(message.hash());
 
 				// Call failed callback
 				if (_failed_callback) {
@@ -1034,6 +1047,7 @@ void LXMRouter::process_outbound() {
 		snprintf(buf, sizeof(buf), "Exception processing outbound message: %s", e.what());
 		ERROR(buf);
 		message.state(Type::Message::FAILED);
+		release_pending_proofs_for_message(message.hash());
 
 		// Call failed callback
 		if (_failed_callback) {
@@ -1486,6 +1500,7 @@ bool LXMRouter::send_via_link(LXMessage& message, Link& link) {
 		} else {
 			ERROR("Unknown message representation");
 			message.state(Type::Message::FAILED);
+			release_pending_proofs_for_message(message.hash());
 			return false;
 		}
 

@@ -680,6 +680,10 @@ namespace LXMF {
 		};
 		static PendingProofSlot _pending_proofs_pool[PENDING_PROOFS_SIZE];
 		static PendingProofSlot* find_pending_proof_slot(const RNS::Bytes& hash);
+		// Release any slot held for a message that will never be proved. The
+		// pool is keyed by packet hash, so a failed message cannot find its own
+		// slot without this.
+		static void release_pending_proofs_for_message(const RNS::Bytes& message_hash);
 		static PendingProofSlot* find_empty_pending_proof_slot();
 		static void static_proof_callback(const RNS::PacketReceipt& receipt);
 
