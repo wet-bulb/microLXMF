@@ -335,6 +335,14 @@ LXMRouter::PendingProofSlot* LXMRouter::find_pending_proof_slot(const Bytes& has
 	return nullptr;
 }
 
+size_t LXMRouter::pending_proofs_count() {
+	size_t count = 0;
+	for (size_t i = 0; i < PENDING_PROOFS_SIZE; i++) {
+		if (_pending_proofs_pool[i].in_use) count++;
+	}
+	return count;
+}
+
 void LXMRouter::release_pending_proofs_for_message(const Bytes& message_hash) {
 	if (message_hash.size() != HASH_SIZE) return;
 	for (size_t i = 0; i < PENDING_PROOFS_SIZE; i++) {
@@ -510,6 +518,17 @@ static void static_outbound_resource_concluded(const Resource& resource) {
 }
 
 // Static proof callback - called when delivery proof is received
+void LXMRouter::static_timeout_callback(const PacketReceipt& receipt) {
+	PendingProofSlot* slot = find_pending_proof_slot(receipt.hash());
+	if (slot) {
+		char buf[128];
+		snprintf(buf, sizeof(buf), "Proof timed out for packet %.16s..., releasing slot",
+		         receipt.hash().toHex().c_str());
+		DEBUG(buf);
+		slot->clear();
+	}
+}
+
 void LXMRouter::static_proof_callback(const PacketReceipt& receipt) {
 	Bytes packet_hash = receipt.hash();
 	char buf[128];
@@ -1450,6 +1469,7 @@ bool LXMRouter::send_via_link(LXMessage& message, Link& link) {
 			// pyxis fork apparently never tested this branch end-to-end.
 			if (receipt) {
 				receipt.set_delivery_callback(static_proof_callback);
+				receipt.set_timeout_callback(static_timeout_callback);
 				PendingProofSlot* slot = find_empty_pending_proof_slot();
 				if (slot) {
 					slot->in_use = true;
@@ -1551,6 +1571,7 @@ bool LXMRouter::send_opportunistic(LXMessage& message, const Identity& dest_iden
 		// Register proof callback to track delivery confirmation
 		if (receipt) {
 			receipt.set_delivery_callback(static_proof_callback);
+			receipt.set_timeout_callback(static_timeout_callback);
 			PendingProofSlot* slot = find_empty_pending_proof_slot();
 			if (slot) {
 				slot->in_use = true;

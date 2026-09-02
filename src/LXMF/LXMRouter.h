@@ -17,6 +17,10 @@ namespace RNS {
 	class AnnounceHandler;
 }
 
+#ifndef LXMF_PENDING_PROOFS_SIZE
+#define LXMF_PENDING_PROOFS_SIZE 32
+#endif
+
 namespace LXMF {
 
 	enum class OutboundAdmissionResult : uint8_t {
@@ -284,6 +288,10 @@ namespace LXMF {
 		 * @return Number of messages waiting to be sent
 		 */
 		inline size_t pending_outbound_count() const { return _pending_outbound_count; }
+		// Pending-proof slots currently held. Mirrors pending_outbound_count().
+		// The pool is static and private, so this is the only observation point
+		// a test has for slot release.
+		static size_t pending_proofs_count();
 		inline bool outbound_queue_has_capacity() const {
 			return _pending_outbound_count < PENDING_OUTBOUND_SIZE;
 		}
@@ -650,7 +658,16 @@ namespace LXMF {
 		// Proof tracking for delivery confirmation - fixed pool (zero heap fragmentation)
 		// Maps packet hash -> message hash so we can update message state when proof arrives
 		// Fixed arrays eliminate ~0.8KB Bytes metadata overhead (16 slots × 2 Bytes × 24 bytes)
-		static constexpr size_t PENDING_PROOFS_SIZE = 16;
+		// Slots for outbound messages awaiting a delivery proof. A message
+		// holds one for up to MAX_DELIVERY_ATTEMPTS x DELIVERY_RETRY_WAIT, so
+		// the pool has to cover concurrent conversations plus retries, not just
+		// the instantaneous send rate. 16 was below MAX_CONVERSATIONS, so a
+		// device talking to every conversation it can store ran out.
+		//
+		// Defaults are unchanged for the store constants; this one is raised to
+		// match MAX_CONVERSATIONS 1:1. Override with e.g.
+		// -DLXMF_PENDING_PROOFS_SIZE=16 to restore the previous size.
+		static constexpr size_t PENDING_PROOFS_SIZE = LXMF_PENDING_PROOFS_SIZE;
 		static constexpr size_t HASH_SIZE = 32;  // SHA256 hash size
 		struct PendingProofSlot {
 			bool in_use = false;
@@ -686,6 +703,11 @@ namespace LXMF {
 		static void release_pending_proofs_for_message(const RNS::Bytes& message_hash);
 		static PendingProofSlot* find_empty_pending_proof_slot();
 		static void static_proof_callback(const RNS::PacketReceipt& receipt);
+		// A receipt that times out will never produce a proof, so the slot it
+		// reserved has to come back here. Without this an OPPORTUNISTIC message
+		// that is sent and never answered holds its slot forever: it reaches
+		// SENT and nothing in process_outbound retires a SENT message.
+		static void static_timeout_callback(const RNS::PacketReceipt& receipt);
 
 	public:
 		// Handle delivery proof for DIRECT messages (called from link packet callback)
